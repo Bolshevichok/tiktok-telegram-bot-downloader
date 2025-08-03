@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  tiktok-bot:
+    build: .
+    container_name: tiktok-downloader-bot
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    driver: bridge
