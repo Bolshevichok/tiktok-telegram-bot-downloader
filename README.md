@@ -9,6 +9,6 @@ A simple Telegram bot for downloading videos and photos from TikTok.
    ```bash
    cp .env.example .env
    ```
-3. Run: `docker-compose up -d`
+3. Run: `docker-compose up -d --build`
 
 That's it! Send TikTok links to your bot.
