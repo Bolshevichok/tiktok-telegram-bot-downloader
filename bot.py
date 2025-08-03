@@ -96,19 +96,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if result['ext'] in ['mp4', 'mov', 'avi']:
                 await update.message.reply_video(
                     video=result['data'],
-                    filename=result['filename'],
-                    caption=f"🎬 {result['title']}"
+                    filename=result['filename']
                 )
             elif result['ext'] in ['jpg', 'jpeg', 'png', 'webp']:
                 await update.message.reply_photo(
-                    photo=result['data'],
-                    caption=f"📸 {result['title']}"
+                    photo=result['data']
                 )
             else:
                 await update.message.reply_document(
                     document=result['data'],
-                    filename=result['filename'],
-                    caption=f"📁 {result['title']}"
+                    filename=result['filename']
                 )
             
             await loading_message.delete()
