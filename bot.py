@@ -21,6 +21,18 @@ class TikTokBot:
     def __init__(self, token: str):
         self.token = token
         self.db = get_db_manager()
+        # Concurrency control
+        try:
+            max_concurrent = int(os.getenv("MAX_CONCURRENT", "5"))
+        except ValueError:
+            max_concurrent = 5
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        # File size limit (in MB) -> bytes
+        try:
+            max_file_mb = int(os.getenv("MAX_FILE_SIZE_MB", "60"))  # default 60MB
+        except ValueError:
+            max_file_mb = 60
+        self.max_file_size = max_file_mb * 1024 * 1024
         logger.info("TikTok bot initialized with database connection")
         
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,74 +131,74 @@ class TikTokBot:
         processing_msg = await update.message.reply_text('⏳ Processing...')
         
         try:
-            services = ['snaptik', 'tikmate', 'mdown', 'ttdownloader']
-            success = False
-            service_used = None
-            request_type = None
-            files_count = 0
-            total_size = 0
-            error_message = None
-            
-            for service_name in services:
-                try:
-                    if service_name == 'snaptik':
-                        from tiktok_downloader import snaptik
-                        downloads = snaptik(tiktok_url)
-                    elif service_name == 'tikmate':
-                        from tiktok_downloader import tikmate
-                        downloads = tikmate(tiktok_url)
-                    elif service_name == 'mdown':
-                        from tiktok_downloader import mdown
-                        downloads = mdown(tiktok_url)
-                    elif service_name == 'ttdownloader':
-                        from tiktok_downloader import ttdownloader
-                        downloads = ttdownloader(tiktok_url)
-                    
-                    if downloads:
-                        logger.info(f"Successfully got {len(downloads)} downloads from {service_name}")
-                        result = await self.send_downloads(update, downloads, service_name)
-                        
-                        if result['success']:
-                            success = True
-                            service_used = service_name
-                            request_type = result.get('type', 'unknown')
-                            files_count = result.get('files_count', 1)
-                            total_size = result.get('total_size', 0)
-                            
-                            await processing_msg.delete()
-                            break
+            async with self.semaphore:
+                services = ['snaptik', 'tikmate', 'mdown', 'ttdownloader']
+                success = False
+                service_used = None
+                request_type = None
+                files_count = 0
+                total_size = 0
+                error_message = None
+
+                for service_name in services:
+                    try:
+                        if service_name == 'snaptik':
+                            from tiktok_downloader import snaptik
+                            downloads = snaptik(tiktok_url)
+                        elif service_name == 'tikmate':
+                            from tiktok_downloader import tikmate
+                            downloads = tikmate(tiktok_url)
+                        elif service_name == 'mdown':
+                            from tiktok_downloader import mdown
+                            downloads = mdown(tiktok_url)
+                        elif service_name == 'ttdownloader':
+                            from tiktok_downloader import ttdownloader
+                            downloads = ttdownloader(tiktok_url)
+
+                        if downloads:
+                            logger.info(f"Successfully got {len(downloads)} downloads from {service_name}")
+                            result = await self.send_downloads(update, downloads, service_name)
+
+                            if result['success']:
+                                success = True
+                                service_used = service_name
+                                request_type = result.get('type', 'unknown')
+                                files_count = result.get('files_count', 1)
+                                total_size = result.get('total_size', 0)
+                                await processing_msg.delete()
+                                break
+                            else:
+                                error_message = result.get('error', 'Failed to send content')
                         else:
-                            error_message = result.get('error', 'Failed to send content')
-                    else:
-                        logger.warning(f"{service_name} returned no downloads")
-                        error_message = f"{service_name} returned no downloads"
-                        
-                except Exception as e:
-                    logger.warning(f"{service_name} failed: {e}")
-                    error_message = str(e)
-                    continue
-            
-            if not success:
-                await processing_msg.edit_text('❌ Failed to download this content')
-            
-            # Log request to database
-            processing_time = time.time() - start_time
-            self.db.log_request(
-                telegram_id=user.id,
-                tiktok_url=tiktok_url,
-                request_type=request_type,
-                service_used=service_used,
-                success=success,
-                file_size=total_size,
-                files_count=files_count,
-                error_message=error_message if not success else None,
-                processing_time=processing_time
-            )
-                
+                            logger.warning(f"{service_name} returned no downloads")
+                            error_message = f"{service_name} returned no downloads"
+
+                    except Exception as e:
+                        logger.warning(f"{service_name} failed: {e}")
+                        error_message = str(e)
+                        continue
+
+                if not success:
+                    await processing_msg.edit_text('❌ Failed to download this content')
+
+                # Log request to database
+                processing_time = time.time() - start_time
+                self.db.log_request(
+                    telegram_id=user.id,
+                    tiktok_url=tiktok_url,
+                    request_type=request_type,
+                    service_used=service_used,
+                    success=success,
+                    file_size=total_size,
+                    files_count=files_count,
+                    error_message=error_message if not success else None,
+                    processing_time=processing_time
+                )
+
         except Exception as e:
             logger.error(f"Error handling message: {e}")
             await processing_msg.edit_text('❌ Error occurred')
-            
+
             # Log error to database
             processing_time = time.time() - start_time
             self.db.log_request(
@@ -205,48 +217,33 @@ class TikTokBot:
             photos = []
             audios = []
             total_size = 0
+            skipped_oversize = 0
             
             for d in downloads:
                 try:
-                    content = d.download()
-                    if isinstance(content, io.BytesIO):
-                        content_bytes = content.getvalue()
-                        total_size += len(content_bytes)
-                        
-                        if len(content_bytes) < 50 * 1024 * 1024:
-                            if content_bytes.startswith(b'\x00\x00\x00'):
-                                logger.info(f"Detected MP4 video: size={len(content_bytes)} bytes, watermark={d.watermark}")
-                                videos.append({
-                                    'content': content_bytes,
-                                    'watermark': d.watermark,
-                                    'download_obj': d
-                                })
-                            elif content_bytes.startswith((b'\xFF\xD8\xFF', b'\x89PNG', b'GIF')):
-                                logger.info(f"Detected image: size={len(content_bytes)} bytes")
-                                photos.append({
-                                    'content': content_bytes,
-                                    'download_obj': d
-                                })
-                            elif str(d.type) == 'music' or content_bytes.startswith((b'ID3', b'\xFF\xFB')):
-                                logger.info(f"Detected audio: size={len(content_bytes)} bytes")
-                                audios.append({
-                                    'content': content_bytes,
-                                    'download_obj': d
-                                })
-                            else:
-                                if str(d.type) == 'video':
-                                    logger.info(f"Fallback video detection: size={len(content_bytes)} bytes, watermark={d.watermark}")
-                                    videos.append({
-                                        'content': content_bytes,
-                                        'watermark': d.watermark,
-                                        'download_obj': d
-                                    })
-                                else:
-                                    logger.info(f"Fallback photo detection: size={len(content_bytes)} bytes")
-                                    photos.append({
-                                        'content': content_bytes,
-                                        'download_obj': d
-                                    })
+                    content = d.download()  # returns BytesIO
+                    if not isinstance(content, io.BytesIO):
+                        continue
+                    size = content.getbuffer().nbytes
+                    if size > self.max_file_size:
+                        skipped_oversize += 1
+                        logger.warning(f"Skipping oversize file {size} bytes > limit {self.max_file_size}")
+                        continue
+                    total_size += size
+                    header = bytes(content.getbuffer()[:12])
+                    # Detection
+                    if header.startswith(b'\x00\x00\x00') or str(d.type) == 'video':
+                        videos.append({'content': content, 'watermark': getattr(d, 'watermark', None), 'download_obj': d, 'size': size})
+                    elif header.startswith((b'\xFF\xD8\xFF', b'\x89PNG', b'GIF')):
+                        photos.append({'content': content, 'download_obj': d, 'size': size})
+                    elif str(d.type) == 'music' or header.startswith((b'ID3', b'\xFF\xFB')):
+                        audios.append({'content': content, 'download_obj': d, 'size': size})
+                    else:
+                        # fallback classify by declared type
+                        if str(d.type) == 'video':
+                            videos.append({'content': content, 'watermark': getattr(d, 'watermark', None), 'download_obj': d, 'size': size})
+                        else:
+                            photos.append({'content': content, 'download_obj': d, 'size': size})
                 except Exception as e:
                     logger.warning(f"Failed to download item: {e}")
                     continue
@@ -257,41 +254,48 @@ class TikTokBot:
             if photos:
                 request_type = 'photos'
                 if len(photos) == 1:
-                    await update.message.reply_photo(photo=io.BytesIO(photos[0]['content']))
+                    photos[0]['content'].seek(0)
+                    await update.message.reply_photo(photo=photos[0]['content'])
                     sent_count += 1
                 else:
                     media = []
                     for photo in photos[:10]:
-                        media.append(InputMediaPhoto(media=io.BytesIO(photo['content'])))
+                        photo['content'].seek(0)
+                        media.append(InputMediaPhoto(media=photo['content']))
                     await update.message.reply_media_group(media=media)
                     sent_count += len(photos)
             
             if videos:
                 request_type = 'video'
-                valid_videos = [v for v in videos if len(v['content']) > 100 * 1024]
+                valid_videos = [v for v in videos if v['size'] > 100 * 1024]
                 
                 if valid_videos:
-                    valid_videos.sort(key=lambda x: (x['watermark'], -len(x['content'])))
+                    valid_videos.sort(key=lambda x: (x['watermark'], -x['size']))
                     
                     best_video = valid_videos[0]
-                    await update.message.reply_video(video=io.BytesIO(best_video['content']))
+                    best_video['content'].seek(0)
+                    await update.message.reply_video(video=best_video['content'])
                     sent_count += 1
                     
-                    logger.info(f"Sent video: size={len(best_video['content'])} bytes, watermark={best_video['watermark']}")
+                    logger.info(f"Sent video: size={best_video['size']} bytes, watermark={best_video['watermark']}")
                 else:
                     logger.warning("All videos were too small (likely thumbnails), skipping video sending")
             
             if sent_count == 0 and audios:
                 request_type = 'audio'
                 for audio in audios[:1]:
-                    await update.message.reply_audio(audio=io.BytesIO(audio['content']))
+                    audio['content'].seek(0)
+                    await update.message.reply_audio(audio=audio['content'])
                     sent_count += 1
             
             if sent_count == 0:
-                await update.message.reply_text('❌ Could not download any content from this URL.')
+                if skipped_oversize and not (videos or photos or audios):
+                    await update.message.reply_text('❌ All media files exceeded the size limit.')
+                else:
+                    await update.message.reply_text('❌ Could not download any content from this URL.')
                 return {
                     'success': False,
-                    'error': 'No content could be sent',
+                    'error': 'No content could be sent (oversize skipped)' if skipped_oversize else 'No content could be sent',
                     'type': request_type,
                     'files_count': 0,
                     'total_size': total_size
