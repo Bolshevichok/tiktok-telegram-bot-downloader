@@ -212,6 +212,33 @@ class TikTokBot:
             )
 
     async def send_downloads(self, update: Update, downloads: List, service_name: str):
+        def is_mp4(h: bytes) -> bool:
+            # MP4: box size (4 bytes) + 'ftyp'
+            return len(h) >= 12 and h[4:8] == b'ftyp'
+        
+        def is_jpeg(h: bytes) -> bool:
+            return h.startswith(b'\xFF\xD8\xFF')
+        
+        def is_png(h: bytes) -> bool:
+            return h.startswith(b'\x89PNG\r\n\x1a\n')
+        
+        def is_gif(h: bytes) -> bool:
+            return h.startswith(b'GIF87a') or h.startswith(b'GIF89a')
+        
+        def is_webp(buf: bytes) -> bool:
+            # RIFF....WEBP
+            return len(buf) >= 12 and buf[0:4] == b'RIFF' and buf[8:12] == b'WEBP'
+        
+        def looks_like_image(header: bytes, first_64: bytes, url: str, declared_type: str) -> bool:
+            if is_jpeg(header) or is_png(header) or is_gif(header) or is_webp(header):
+                return True
+            ext_match = any(url.lower().split('?')[0].endswith(x) for x in ('.jpg', '.jpeg', '.png', '.gif', '.webp'))
+            if ext_match:
+                return True
+            if declared_type in ('image','photo','photos','picture'):
+                return True
+            return False
+        
         try:
             videos = []
             photos = []
@@ -230,20 +257,38 @@ class TikTokBot:
                         logger.warning(f"Skipping oversize file {size} bytes > limit {self.max_file_size}")
                         continue
                     total_size += size
-                    header = bytes(content.getbuffer()[:12])
-                    # Detection
-                    if header.startswith(b'\x00\x00\x00') or str(d.type) == 'video':
-                        videos.append({'content': content, 'watermark': getattr(d, 'watermark', None), 'download_obj': d, 'size': size})
-                    elif header.startswith((b'\xFF\xD8\xFF', b'\x89PNG', b'GIF')):
-                        photos.append({'content': content, 'download_obj': d, 'size': size})
-                    elif str(d.type) == 'music' or header.startswith((b'ID3', b'\xFF\xFB')):
+                    
+                    # Read header / sample
+                    raw = content.getbuffer()
+                    header = bytes(raw[:16])
+                    first_64 = bytes(raw[:64])
+                    
+                    declared_type = str(getattr(d, 'type', '')).lower()
+                    url = str(getattr(d, 'url', ''))
+                    
+                    # Audio detection
+                    if declared_type == 'music' or first_64.startswith(b'ID3') or first_64.startswith(b'\xFF\xFB'):
                         audios.append({'content': content, 'download_obj': d, 'size': size})
+                        continue
+                    
+                    # Image detection
+                    if looks_like_image(header, first_64, url, declared_type):
+                        photos.append({'content': content, 'download_obj': d, 'size': size})
+                        continue
+                    
+                    # Video detection (MP4 or declared video). Some services give slideshow MP4 for photo posts.
+                    if is_mp4(header) or declared_type == 'video':
+                        # Heuristic: if this is a suspected slideshow for a photo post and we ALSO have other images later,
+                        # we'll still collect it as video but prefer images when sending.
+                        videos.append({'content': content, 'watermark': getattr(d, 'watermark', None), 'download_obj': d, 'size': size})
+                        continue
+                    
+                    # Fallback: if nothing matched, treat as photo if small; else video
+                    if size < 800_000:  # likely an image (small)
+                        photos.append({'content': content, 'download_obj': d, 'size': size})
                     else:
-                        # fallback classify by declared type
-                        if str(d.type) == 'video':
-                            videos.append({'content': content, 'watermark': getattr(d, 'watermark', None), 'download_obj': d, 'size': size})
-                        else:
-                            photos.append({'content': content, 'download_obj': d, 'size': size})
+                        videos.append({'content': content, 'watermark': getattr(d, 'watermark', None), 'download_obj': d, 'size': size})
+                
                 except Exception as e:
                     logger.warning(f"Failed to download item: {e}")
                     continue
@@ -251,7 +296,9 @@ class TikTokBot:
             sent_count = 0
             request_type = 'unknown'
             
-            if photos:
+            # Preference logic: if we have any photos AND no "real" large videos (>1MB) we treat as photo post
+            large_videos = [v for v in videos if v['size'] > 1_000_000]
+            if photos and not large_videos:
                 request_type = 'photos'
                 if len(photos) == 1:
                     photos[0]['content'].seek(0)
@@ -265,34 +312,32 @@ class TikTokBot:
                     await update.message.reply_media_group(media=media)
                     sent_count += len(photos)
             
-            if videos:
+            # Send video only if nothing already sent
+            if sent_count == 0 and videos:
                 request_type = 'video'
-                valid_videos = [v for v in videos if v['size'] > 100 * 1024]
-                
-                if valid_videos:
-                    valid_videos.sort(key=lambda x: (x['watermark'], -x['size']))
-                    
-                    best_video = valid_videos[0]
-                    best_video['content'].seek(0)
-                    await update.message.reply_video(video=best_video['content'])
-                    sent_count += 1
-                    
-                    logger.info(f"Sent video: size={best_video['size']} bytes, watermark={best_video['watermark']}")
-                else:
-                    logger.warning("All videos were too small (likely thumbnails), skipping video sending")
+                # Filter out tiny "thumbnail" or slideshow artifacts (<120KB) unless no other choice
+                filtered_videos = [v for v in videos if v['size'] > 120 * 1024] or videos
+                # Prefer non-watermark, then bigger size
+                filtered_videos.sort(key=lambda x: (x.get('watermark') is True, -x['size']))
+                best_video = filtered_videos[0]
+                best_video['content'].seek(0)
+                await update.message.reply_video(video=best_video['content'])
+                sent_count += 1
+                logger.info(f"Sent video: size={best_video['size']} bytes, watermark={best_video.get('watermark')}")
             
+            # Fallback to audio
             if sent_count == 0 and audios:
                 request_type = 'audio'
-                for audio in audios[:1]:
-                    audio['content'].seek(0)
-                    await update.message.reply_audio(audio=audio['content'])
-                    sent_count += 1
+                audio = audios[0]
+                audio['content'].seek(0)
+                await update.message.reply_audio(audio=audio['content'])
+                sent_count += 1
             
             if sent_count == 0:
                 if skipped_oversize and not (videos or photos or audios):
-                    await update.message.reply_text('❌ All media files exceeded the size limit.')
+                    await update.message.reply_text('❌ Все файлы превышают лимит размера.')
                 else:
-                    await update.message.reply_text('❌ Could not download any content from this URL.')
+                    await update.message.reply_text('❌ Не удалось скачать контент по ссылке.')
                 return {
                     'success': False,
                     'error': 'No content could be sent (oversize skipped)' if skipped_oversize else 'No content could be sent',
@@ -310,7 +355,7 @@ class TikTokBot:
                 
         except Exception as e:
             logger.error(f"Error in send_downloads: {e}")
-            await update.message.reply_text('❌ Error processing downloads')
+            await update.message.reply_text('❌ Ошибка при обработке загрузок')
             return {
                 'success': False,
                 'error': str(e),
